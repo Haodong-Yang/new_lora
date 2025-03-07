@@ -16,10 +16,10 @@ from ..utils import (
     _get_submodules,
     transpose,
 )
-from .lora import (
-    LoraConfig,
+from .moesvd import (
+    MoESVDConfig,
     LoraLayer,
-    LoraModel,
+    MoESVDModel,
     mark_only_lora_as_trainable,
 )
 
@@ -33,7 +33,7 @@ if is_bnb_available():
 
 
 @dataclass
-class AdaLoraConfig(LoraConfig):
+class AdaLoraConfig(MoESVDConfig):
     """
     This is the configuration class to store the configuration of a [`~peft.AdaLora`].
 
@@ -65,7 +65,7 @@ class AdaLoraConfig(LoraConfig):
         self.peft_type = PeftType.ADALORA
 
 
-class AdaLoraModel(LoraModel):
+class AdaLoraModel(MoESVDModel):
     """
     Creates AdaLoRA (Adaptive LoRA) model from a pretrained transformers model. Paper:
     https://openreview.net/pdf?id=lq62uWRJjiY

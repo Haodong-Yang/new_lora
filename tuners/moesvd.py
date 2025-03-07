@@ -41,12 +41,12 @@ if is_bnb_available():
 
 
 @dataclass
-class LoraConfig(PeftConfig):
+class MoESVDConfig(PeftConfig):
     """
     This is the configuration class to store the configuration of a [`LoraModel`].
 
     Args:
-        r (`int`): Lora attention dimension.
+        num_experts (`int`): Number of experts.
         target_modules (`Union[List[str],str]`): The names of the modules to apply Lora to.
         lora_alpha (`float`): The alpha parameter for Lora scaling.
         lora_dropout (`float`): The dropout probability for Lora layers.
@@ -57,7 +57,7 @@ class LoraConfig(PeftConfig):
             and saved in the final checkpoint.
     """
 
-    r: int = field(default=8, metadata={"help": "Lora attention dimension"})
+    num_experts: int = field(default=4, metadata={"help": "Number of experts"})
     target_modules: Optional[Union[List[str], str]] = field(
         default=None,
         metadata={
@@ -89,7 +89,7 @@ class LoraConfig(PeftConfig):
         self.peft_type = PeftType.LORA
 
 
-class LoraModel(torch.nn.Module):
+class MoESVDModel(torch.nn.Module):
     """
     Creates Low Rank Adapter (Lora) model from a pretrained transformers model.
 
@@ -177,7 +177,7 @@ class LoraModel(torch.nn.Module):
             )
         is_target_modules_in_base_model = False
         kwargs = {
-            "r": lora_config.r,
+            "num_experts": lora_config.num_experts,
             "lora_alpha": lora_config.lora_alpha,
             "lora_dropout": lora_config.lora_dropout,
             "fan_in_fan_out": lora_config.fan_in_fan_out,
@@ -457,7 +457,7 @@ class LoraLayer:
             self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
             self.reset_lora_parameters(adapter_name)
-        self.to(self.weight.device)
+        # self.to(self.weight.device)
 
     def update_layer_embedding(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
         self.r[adapter_name] = r
@@ -479,7 +479,7 @@ class LoraLayer:
             self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
             self.reset_lora_parameters(adapter_name)
-        self.to(self.weight.device)
+        # self.to(self.weight.device)
 
     def reset_lora_parameters(self, adapter_name):
         if adapter_name in self.lora_A.keys():
@@ -491,6 +491,66 @@ class LoraLayer:
             nn.init.zeros_(self.lora_embedding_A[adapter_name])
             nn.init.normal_(self.lora_embedding_B[adapter_name])
 
+class MoE(nn.Linear):
+    def __init__(self, adapter_name, in_features, out_features, num_experts, lora_alpha, lora_dropout, fan_in_fan_out, **kwargs):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        self.weight.requires_grad = False
+
+        self.fan_in_fan_out = fan_in_fan_out
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.T
+
+        init_lora_weights = kwargs.pop("init_lora_weights", True)
+        bias = kwargs.pop("bias", "none")
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList([Linear(adapter_name, in_features, out_features, 2**i, lora_alpha, lora_dropout, init_lora_weights, bias) for i in range(num_experts)])
+        self.gate = nn.Linear(in_features, num_experts)
+    
+    def forward(self, x):
+        b, n, d = x.shape
+        x_2d = x.reshape(b*n, d)
+        gate_score = F.softmax(self.gate(x_2d), dim=-1)
+        expert_outputs = torch.stack([expert(x_2d) for expert in self.experts], dim=1)
+        output = torch.bmm(gate_score.unsqueeze(1), expert_outputs).squeeze(1)
+        original_output = F.linear(x_2d, self.weight, self.bias)
+        output += original_output
+        output = output.reshape(b, n, -1)
+        return output
+        """
+        进行MoE逻辑的前向传播：先计算 gating，然后汇总所有Expert的增量。
+        
+        # gating shape: [batch_size, num_experts]
+        gating_scores = self.gate_proj(x)  # [batch, num_experts]
+        # softmax得到每个expert的加权系数
+        gating_scores = F.softmax(gating_scores, dim=-1)  # [batch, num_experts]
+
+        # experts增量累加
+        lora_output = 0
+        for expert in self.experts:
+
+        for i in range(self.num_experts):
+            A_i = self.experts_A[i]
+            B_i = self.experts_B[i]
+            drop_i = self.experts_dropout[i]
+            scale_i = self.experts_scaling[i]
+            if A_i is not None and B_i is not None and scale_i != 0:
+                # 先 dropout(x)
+                x_i = drop_i(x)
+                # [batch, r_i]
+                out_A_i = A_i(x_i)
+                # [batch, out_features]
+                out_B_i = B_i(out_A_i)
+                # [batch, out_features]
+                inc_i = out_B_i * scale_i
+
+                # gating系数：每个expert都是 [batch_size,1] broadast
+                gate_i = gating_scores[:, i].unsqueeze(-1)  # [batch,1]
+                inc_i = inc_i * gate_i  # [batch, out_features]
+
+                lora_output = lora_output + inc_i
+        return lora_output
+        """
+      
 
 class Linear(nn.Linear, LoraLayer):
     # Lora implemented in a dense layer
@@ -502,24 +562,25 @@ class Linear(nn.Linear, LoraLayer):
         r: int = 0,
         lora_alpha: int = 1,
         lora_dropout: float = 0.0,
-        fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
-        **kwargs,
+        # fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+        init_lora_weights: bool = True,
+        bias: str = "none"
     ):
-        init_lora_weights = kwargs.pop("init_lora_weights", True)
 
-        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        # nn.Linear.__init__(self, in_features, out_features, **kwargs)
         LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
+        self.bias = bias
         # Freezing the pre-trained weight matrix
-        self.weight.requires_grad = False
+        # self.weight.requires_grad = False
 
-        self.fan_in_fan_out = fan_in_fan_out
-        if fan_in_fan_out:
-            self.weight.data = self.weight.data.T
+        # self.fan_in_fan_out = fan_in_fan_out
+        # if fan_in_fan_out:
+        #     self.weight.data = self.weight.data.T
 
-        nn.Linear.reset_parameters(self)
+        # nn.Linear.reset_parameters(self)
         self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
         self.active_adapter = adapter_name
-
+    '''
     def merge(self):
         if self.active_adapter not in self.lora_A.keys():
             return
@@ -551,32 +612,16 @@ class Linear(nn.Linear, LoraLayer):
                 * self.scaling[self.active_adapter]
             )
             self.merged = False
-
+    '''
     def forward(self, x: torch.Tensor):
         previous_dtype = x.dtype
-
-        if self.active_adapter not in self.lora_A.keys():
-            return F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
-        if self.disable_adapters:
-            if self.r[self.active_adapter] > 0 and self.merged:
-                self.unmerge()
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
-        elif self.r[self.active_adapter] > 0 and not self.merged:
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
-
-            x = x.to(self.lora_A[self.active_adapter].weight.dtype)
-
-            result += (
-                self.lora_B[self.active_adapter](
-                    self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
-                )
-                * self.scaling[self.active_adapter]
+        result = (
+            self.lora_B[self.active_adapter](
+                self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
             )
-        else:
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
-
+            * self.scaling[self.active_adapter]
+        )
         result = result.to(previous_dtype)
-
         return result
 
 
@@ -720,3 +765,193 @@ if is_bnb_available():
                     )
                 result += output
             return result
+
+'''
+class MoELoraLayer:
+    """
+    这是一个新的基类，用来管理多专家(MoE)的LoRA参数，每个Expert可以有自己的rank。
+    """
+    def __init__(self, in_features, out_features, num_experts, lora_alpha, lora_dropout):
+        """
+        参数：
+         - in_features, out_features: 线性层输入/输出大小
+         - num_experts: 专家数量
+         - experts_rank: list/tuple，长度=num_experts，每个元素是对应专家的rank
+         - experts_alpha: list/tuple，长度=num_experts，每个元素是对应专家的alpha
+         - experts_dropout: list/tuple，长度=num_experts，每个元素是对应专家的dropout
+        """
+        super().__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_experts = num_experts
+
+        # 下面创建若干ModuleList来保存多专家的参数
+        self.experts_A = nn.ModuleList()
+        self.experts_B = nn.ModuleList()
+        self.experts_dropout = nn.ModuleList()
+        self.experts_scaling = []
+
+        for i in range(num_experts):
+            r_i = 2**i
+            alpha_i = lora_alpha
+            dropout_i = lora_dropout
+
+            # 如果rank=0，可以直接放一个None or Identity
+            if r_i > 0:
+                layer_A = nn.Linear(in_features, r_i, bias=False)
+                layer_B = nn.Linear(r_i, out_features, bias=False)
+            else:
+                # dummy placeholder
+                layer_A = None
+                layer_B = None
+
+            # dropout
+            if dropout_i > 0.0:
+                dropout_layer = nn.Dropout(p=dropout_i)
+            else:
+                dropout_layer = nn.Identity()
+
+            self.experts_A.append(layer_A)
+            self.experts_B.append(layer_B)
+            self.experts_dropout.append(dropout_layer)
+
+            # scaling = alpha / rank
+            if r_i > 0:
+                self.experts_scaling.append(alpha_i / r_i)
+            else:
+                self.experts_scaling.append(0.0)
+
+        # gating网络：最简单做法是对每个expert学一个可训练的标量gate，也可以是MLP
+        # 这里做一个最简单的线性 gating：输入 dim -> num_experts
+        # 你也可以改成 self.gate_proj = nn.Parameter(torch.zeros(num_experts))
+        self.gate_proj = nn.Linear(in_features, num_experts, bias=False)
+
+        # 是否已经merge
+        self.merged = False
+        # 是否禁用
+        self.disable_adapters = False
+
+    def merge(self):
+        """
+        将所有专家的参数合并到 self.weight 上。
+        即 weight += sum_i( (B_i@A_i)*scaling_i )。
+        """
+        if self.merged:
+            warnings.warn("Already merged. Nothing to do.")
+            return
+
+        # 要确保 rank>0 的专家才 merge
+        weight_data = self.weight.data
+        for i in range(self.num_experts):
+            A_i = self.experts_A[i]
+            B_i = self.experts_B[i]
+            scale_i = self.experts_scaling[i]
+            if A_i is not None and B_i is not None and scale_i != 0:
+                weight_data += B_i.weight @ A_i.weight * scale_i
+
+        self.merged = True
+
+    def unmerge(self):
+        """
+        反向操作，把上次 merge 的参数减掉。
+        """
+        if not self.merged:
+            warnings.warn("Already unmerged. Nothing to do.")
+            return
+
+        weight_data = self.weight.data
+        for i in range(self.num_experts):
+            A_i = self.experts_A[i]
+            B_i = self.experts_B[i]
+            scale_i = self.experts_scaling[i]
+            if A_i is not None and B_i is not None and scale_i != 0:
+                weight_data -= B_i.weight @ A_i.weight * scale_i
+
+        self.merged = False
+
+    def forward_moe(self, x: torch.Tensor):
+        """
+        进行MoE逻辑的前向传播：先计算 gating，然后汇总所有Expert的增量。
+        """
+        # gating shape: [batch_size, num_experts]
+        gating_scores = self.gate_proj(x)  # [batch, num_experts]
+        # softmax得到每个expert的加权系数
+        gating_scores = F.softmax(gating_scores, dim=-1)  # [batch, num_experts]
+
+        # experts增量累加
+        lora_output = 0
+        for i in range(self.num_experts):
+            A_i = self.experts_A[i]
+            B_i = self.experts_B[i]
+            drop_i = self.experts_dropout[i]
+            scale_i = self.experts_scaling[i]
+            if A_i is not None and B_i is not None and scale_i != 0:
+                # 先 dropout(x)
+                x_i = drop_i(x)
+                # [batch, r_i]
+                out_A_i = A_i(x_i)
+                # [batch, out_features]
+                out_B_i = B_i(out_A_i)
+                # [batch, out_features]
+                inc_i = out_B_i * scale_i
+
+                # gating系数：每个expert都是 [batch_size,1] broadast
+                gate_i = gating_scores[:, i].unsqueeze(-1)  # [batch,1]
+                inc_i = inc_i * gate_i  # [batch, out_features]
+
+                lora_output = lora_output + inc_i
+        return lora_output
+
+class MoELinear(nn.Linear, MoELoraLayer):
+    """
+    把MoELoraLayer与nn.Linear结合在一起。
+    """
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        **kwargs,
+    ):
+        num_experts = kwargs.pop("num_experts", 4)  # 这里的 4 是默认值
+        lora_alpha = kwargs.pop("lora_alpha", 1)
+        lora_dropout = kwargs.pop("lora_dropout", 0.1)
+        fan_in_fan_out = kwargs.pop("fan_in_fan_out", False)
+        init_lora_weights = kwargs.pop("init_lora_weights", True)
+
+        super(nn.Linear, self).__init__(in_features, out_features, **kwargs)
+        MoELoraLayer.__init__(self, in_features, out_features, num_experts,
+                              lora_alpha, lora_dropout)
+
+        # 冻结原始Linear权重
+        self.weight.requires_grad = False
+
+        # 是否转置
+        self.fan_in_fan_out = fan_in_fan_out
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.T
+
+        # pytorch默认Linear初始化
+        nn.Linear.reset_parameters(self)
+
+    def forward(self, x: torch.Tensor):
+        """
+        在前向时先走原始Frozen权重，再加上 MoE LoRA 分支。
+        """
+        if self.disable_adapters:
+            # 如果 disable 了，就只用原始权重
+            if self.merged:
+                self.unmerge()
+            return F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+
+        if not self.merged:
+            # 1) 原始权重的输出
+            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+            # 2) 叠加MoE LoRA的输出
+            lora_increment = self.forward_moe(x)
+            result = result + lora_increment
+            return result
+        else:
+            # 如果已经merge，就直接用合并后的权重
+            return F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+'''

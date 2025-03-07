@@ -31,10 +31,11 @@ from transformers.utils import PushToHubMixin
 from .tuners import (
     AdaLoraModel,
     AdaptionPromptModel,
-    LoraModel,
+    # LoraModel,
     PrefixEncoder,
     PromptEmbedding,
     PromptEncoder,
+    MoESVDModel,
 )
 from .utils import (
     TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING,
@@ -52,7 +53,8 @@ from .utils import (
 
 
 PEFT_TYPE_TO_MODEL_MAPPING = {
-    PeftType.LORA: LoraModel,
+    # PeftType.LORA: LoraModel,
+    PeftType.MOESVD: MoESVDModel,
     PeftType.PROMPT_TUNING: PromptEmbedding,
     PeftType.P_TUNING: PromptEncoder,
     PeftType.PREFIX_TUNING: PrefixEncoder,

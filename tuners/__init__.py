@@ -18,7 +18,8 @@
 # limitations under the License.
 
 from .adaption_prompt import AdaptionPromptConfig, AdaptionPromptModel
-from .lora import LoraConfig, LoraModel
+# from .lora import LoraConfig, LoraModel
+from .moesvd import MoESVDConfig, MoESVDModel
 from .adalora import AdaLoraConfig, AdaLoraModel
 from .p_tuning import PromptEncoder, PromptEncoderConfig, PromptEncoderReparameterizationType
 from .prefix_tuning import PrefixEncoder, PrefixTuningConfig
